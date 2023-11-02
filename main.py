@@ -116,7 +116,7 @@ class ExcelWriter:
 
 def job():
     logging.info('Job started.')
-    directory = "//192.168.40.50/ParamComments"
+    directory = "DIR"
     parser = Parser(directory)
     df_txt = parser.parse_txt()
     db_query = DatabaseQuery(df_txt)
