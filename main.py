@@ -1,161 +1,159 @@
+import asyncio
 import json
 import logging
+import logging.config
 import os
-import time
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 
-import mysql.connector
-import pandas as pd
-import schedule
+import aiofiles
+import aiomysql
 
-# Настройка логирования
-log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-log_file = "parser.log"
+# Настройка асинхронного логгера
+logging.config.dictConfig({
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'file': {
+            'class': 'logging.FileHandler',
+            'filename': 'parser.log',
+            'formatter': 'standard',
+        },
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'standard',
+        },
+    },
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s [%(levelname)s] %(message)s',
+        },
+    },
+    'root': {
+        'handlers': ['file', 'console'],
+        'level': 'INFO',
+    },
+})
 
-log_handler = RotatingFileHandler(log_file, mode='a', maxBytes=5 * 1024 * 1024, backupCount=2, encoding=None, delay=0)
-log_handler.setFormatter(log_formatter)
-log_handler.setLevel(logging.INFO)
-
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-console_handler.setLevel(logging.INFO)
-
-logger = logging.getLogger()
-logger.addHandler(log_handler)
-logger.addHandler(console_handler)
-logger.setLevel(logging.INFO)
+# Параметры подключения к базе данных
+DB_CONFIG = {
+    'host': 'HOST',
+    'port': 'PORT',
+    'user': 'USER',
+    'password': 'PASSWORD',
+    'db': 'DB',
+}
 
 
-class Parser:
+# Класс для асинхронного парсинга текстовых файлов
+class AsyncParser:
     def __init__(self, path_directory):
         self.path_directory = path_directory
-        self.data = {"Name": [], "Device ID": []}
 
-    def parse_txt(self):
-        logging.info('Начало разбора текстовых файлов')
+    async def parse_txt(self):
+        data = {"Name": [], "Device ID": []}
         for filename in os.listdir(self.path_directory):
             if "КОТ" in filename:
-                with open(os.path.join(self.path_directory, filename), "r") as file:
-                    lines = file.readlines()
-                device_id = None
-                for line in lines:
-                    if "=" in line:
-                        name, value = line.strip().split("=")
-                        if "DevID" in name:
-                            device_id = value
-                        if "Подпитка" in value and "м3" in value and device_id is not None:
-                            self.data["Device ID"].append(device_id)
-                            self.data["Name"].append(name)
-        logging.info('Разбор текстовых файлов завершен')
-        return pd.DataFrame(self.data)
+                async with aiofiles.open(os.path.join(self.path_directory, filename), mode='r') as file:
+                    async for line in file:
+                        if "=" in line:
+                            name, value = line.strip().split("=")
+                            if "DevID" in name:
+                                device_id = value
+                            if "Подпитка" in value and "м3" in value:
+                                data["Device ID"].append(device_id)
+                                data["Name"].append(name)
+        logging.info('Текстовые файлы успешно обработаны')
+        return data
 
 
-class DatabaseQuery:
-    def __init__(self, prsd_txt):
+# Класс для асинхронных запросов к базе данных
+class AsyncDatabaseQuery:
+    def __init__(self, db_config, prsd_txt):
+        self.db_config = db_config
         self.prsd_txt = prsd_txt
-        self.data1 = []
-        self.data2 = []
 
-    def query_db(self):
-        with mysql.connector.connect(
-                host='HOST',
-                user='USER',
-                password='PASSWORD',
-                database='DB'
-        ) as conn:
-            cursor = conn.cursor()
+    async def query_db(self):
+        data1 = {}
+        data2 = {}
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        async with aiomysql.create_pool(**self.db_config) as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cursor:
+                    for device_id, name in zip(self.prsd_txt['Device ID'], self.prsd_txt['Name']):
+                        query1 = f"""SELECT dev.DEVICE_ID, dev.DEVICE_NAME, ap.PARAMETER_NAME, d.MEASURE_VALUE
+                        FROM powerdb.devices dev
+                        LEFT JOIN powerdb.adapters a ON dev.DEVICE_ID = a.ID_DEVICE
+                        LEFT JOIN powerdb.adapter_parameters ap ON a.ID_ADAPTER = ap.ID_ADAPTER
+                        LEFT OUTER JOIN powerdb.records r ON a.ID_ADAPTER = r.ID_ADAPTER
+                        LEFT OUTER JOIN powerdb.data d ON ap.ID_PARAMETER = d.ID_PARAMETER and r.ID_RECORD = d.ID_RECORD
+                        WHERE (r.RECORD_TIME = '{current_date}' or r.RECORD_TIME is NULL) and
+                        a.ID_ADAPTER in
+                        (SELECT ID_ADAPTER FROM adapters a WHERE ADAPTER_NAME = "Энергия на начало суток")
+                        and dev.DEVICE_NAME LIKE "%КОТ%"
+                        and ap.PARAMETER_NAME = "A+ (активная суммарная)"
+                        ORDER BY dev.DEVICE_NAME;"""
+                        query2 = f"""SELECT dev.DEVICE_ID, dev.DEVICE_NAME, ap.PARAMETER_NAME, d.MEASURE_VALUE
+                        FROM powerdb.devices dev
+                        LEFT JOIN powerdb.adapters a ON dev.DEVICE_ID = a.ID_DEVICE
+                        LEFT JOIN powerdb.adapter_parameters ap ON a.ID_ADAPTER = ap.ID_ADAPTER
+                        LEFT OUTER JOIN powerdb.records r ON a.ID_ADAPTER = r.ID_ADAPTER
+                        LEFT OUTER JOIN powerdb.data d ON ap.ID_PARAMETER = d.ID_PARAMETER and r.ID_RECORD = d.ID_RECORD
+                        WHERE (r.RECORD_TIME = '{current_date}' or r.RECORD_TIME is NULL) and
+                        a.ID_ADAPTER in
+                        (SELECT ID_ADAPTER FROM adapters a WHERE a.ID_DEVICE = "{device_id}" and ADAPTER_NAME = 
+                        "Суточный архив") and ap.PARAMETER_NAME in ("{name}")
+                        and dev.DEVICE_NAME LIKE "%КОТ%"
+                        ORDER BY dev.DEVICE_NAME;"""
+                        
+                        await cursor.execute(query1)
+                        result1 = await cursor.fetchall()
+                        data1.setdefault(device_id, []).extend(result1)
+                        await cursor.execute(query2)
+                        result2 = await cursor.fetchall()
+                        data2.setdefault(device_id, []).extend(result2)
 
-            for index, row in self.prsd_txt.iterrows():
-                device_id = row['Device ID']
-                name = row['Name']
-                current_date = datetime.now().strftime('%Y-%m-d')
-
-                # Запросы на получение электроэнергии на начало суток и подпитки
-                queries = [f"""
-                SELECT dev.DEVICE_ID, dev.DEVICE_NAME, ap.PARAMETER_NAME, d.MEASURE_VALUE
-                FROM powerdb.devices dev
-                LEFT JOIN powerdb.adapters a ON dev.DEVICE_ID = a.ID_DEVICE
-                LEFT JOIN powerdb.adapter_parameters ap ON a.ID_ADAPTER = ap.ID_ADAPTER
-                LEFT OUTER JOIN powerdb.records r ON a.ID_ADAPTER = r.ID_ADAPTER
-                LEFT OUTER JOIN powerdb.data d ON ap.ID_PARAMETER = d.ID_PARAMETER and r.ID_RECORD = d.ID_RECORD
-                WHERE (r.RECORD_TIME = '{current_date}' or r.RECORD_TIME is NULL) and
-                a.ID_ADAPTER in
-                (SELECT ID_ADAPTER FROM adapters a WHERE ADAPTER_NAME = "Энергия на начало суток")
-                and
-                ORDER BY dev.DEVICE_NAME;
-                """,
-                           f"""
-                SELECT ap.PARAMETER_NAME, d.MEASURE_VALUE
-                FROM powerdb.devices dev
-                LEFT JOIN powerdb.adapters a ON dev.DEVICE_ID = a.ID_DEVICE
-                LEFT JOIN powerdb.adapter_parameters ap ON a.ID_ADAPTER = ap.ID_ADAPTER
-                LEFT OUTER JOIN powerdb.records r ON a.ID_ADAPTER = r.ID_ADAPTER
-                LEFT OUTER JOIN powerdb.data d ON ap.ID_PARAMETER = d.ID_PARAMETER and r.ID_RECORD = d.ID_RECORD
-                WHERE (r.RECORD_TIME = '{current_date}' or r.RECORD_TIME is NULL) and
-                a.ID_ADAPTER in
-                (SELECT ID_ADAPTER FROM adapters a WHERE a.ID_DEVICE = "{device_id}" and ADAPTER_NAME = "Суточный архив")
-                and ap.PARAMETER_NAME in ("{name}")
-                ORDER BY dev.DEVICE_NAME;
-                """
-                           ]
-
-                for i, query in enumerate(queries):
-                    try:
-                        # Логирование SQL-запросов
-                        logging.info(f'Выполнение SQL-запроса {i + 1}: {query}')
-                        cursor.execute(query)
-                        results = cursor.fetchall()
-                        for result in results:
-                            if result and not all(pd.isnull(val) for val in result):
-                                if i == 0:
-                                    self.data1.append(result)
-                                else:
-                                    self.data2.append(result)
-                    except Exception as e:
-                        logging.error(f"Ошибка при выполнении SQL-запроса {i + 1}: {str(e)}")
-
-        self.data1 = pd.DataFrame(self.data1, columns=['Device_Id', 'Device_Name', 'Parameter_Name', 'Measure_Value'])
-        self.data2 = pd.DataFrame(self.data2, columns=['Parameter_Name', 'Measure_Value'])
-
-        return self.data1, self.data2
+        logging.info('Запросы к базе данных выполнены')
+        return data1, data2
 
 
-class JsonWriter:
+# Класс для записи данных в формат JSON
+class AsyncJsonWriter:
     def __init__(self, prsd_txt, prsd_db1, prsd_db2):
         self.prsd_txt = prsd_txt
         self.prsd_db1 = prsd_db1
         self.prsd_db2 = prsd_db2
 
-    def to_json(self):
+    async def to_json(self):
         all_data = {
-            "Parsed Text Data": self.prsd_txt.to_dict(orient='records'),
-            "Database Query Data 1": self.prsd_db1.to_dict(orient='records'),
-            "Database Query Data 2": self.prsd_db2.to_dict(orient='records')
+            "Parsed Text Data": self.prsd_txt,
+            "Database Query Data 1": self.prsd_db1,
+            "Database Query Data 2": self.prsd_db2
         }
-
         filename = datetime.now().strftime("%Y%m%d") + "_all_data.json"
-
-        with open(filename, 'w') as json_file:
-            json.dump(all_data, json_file, ensure_ascii=False, indent=4)
-
-        logging.info(f'JSON file {filename} has been written.')
+        async with aiofiles.open(filename, mode='w') as file:
+            await file.write(json.dumps(all_data, ensure_ascii=False, indent=4))
+        logging.info(f'Данные записаны в файл {filename}')
 
 
-def job():
-    logging.info('Job started.')
-    directory = "DIR"
-    parser = Parser(directory)
-    df_txt = parser.parse_txt()
-    db_query = DatabaseQuery(df_txt)
-    df_db1, df_db2 = db_query.query_db()
-    writer = JsonWriter(df_txt, df_db1, df_db2)
-    writer.to_json()
-    logging.info('Job completed.')
+# Основная асинхронная функция для выполнения работы
+async def job():
+    path_directory = "DIR"
+    parser = AsyncParser(path_directory)
+    prsd_txt = await parser.parse_txt()
+
+    db_query = AsyncDatabaseQuery(DB_CONFIG, prsd_txt)
+    prsd_db1, prsd_db2 = await db_query.query_db()
+
+    writer = AsyncJsonWriter(prsd_txt, prsd_db1, prsd_db2)
+    await writer.to_json()
 
 
-schedule.every().day.at("09:57").do(job)
+# Функция для запуска асинхронной задачи
+async def main():
+    logging.info("Запуск основной асинхронной задачи")
+    await job()
 
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+
+# Запуск асинхронной функции main
+if __name__ == "__main__":
+    asyncio.run(main())
